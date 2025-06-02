@@ -4,10 +4,8 @@ services:
     env: python
     plan: free
     region: frankfurt          # puedes dejarlo o cambiarlo
-    buildCommand: |
-      pip install -r app/requirements.txt
-      playwright install --with-deps
-    startCommand: uvicorn app.main:app --host 0.0.0.0 --port 8000
+Build Command: pip install -r app/requirements.txt && playwright install --with-deps
+Start Command: uvicorn app.main:app --host 0.0.0.0 --port $PORT
     envVars:
       - key: OPENAI_API_KEY
         sync: false
