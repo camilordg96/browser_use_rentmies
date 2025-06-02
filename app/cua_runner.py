@@ -1,67 +1,146 @@
-import os, time, base64
+python
+"""HubSpot meeting automation with planner/executor split.
+
+Usage examples (local):
+    python cua_runner.py               # runs default
+    python cua_runner.py "<hubspot URL>" "Ana" "López" "ana@email.com" "11"
+
+When imported, call run_cua(meeting_url, ...) directly.
+
+Environment variables consumed:
+    OPENAI_API_KEY          OpenAI secret key
+    OPENAI_MODEL_PLANNER    Defaults to "o3-mini"
+    OPENAI_MODEL_EXECUTOR   Defaults to "computer-use-preview"
+
+The script is designed for Render (FastAPI wrapper) **and** standalone CLI.
+"""
+
+import os
+import sys
+import time
+import base64
+from pathlib import Path
+from typing import Optional
+
 from openai import OpenAI
 from playwright.sync_api import sync_playwright
 
-PLANNER_MODEL   = os.getenv("OPENAI_MODEL_PLANNER",   "o3-mini")
-EXECUTOR_MODEL  = os.getenv("OPENAI_MODEL_EXECUTOR",  "computer-use-preview")
-API_KEY         = os.getenv("OPENAI_API_KEY")
+# ──────────────────────────────────────────────────────────────────────────────
+# Configuration from environment variables (with sane defaults)
+# ──────────────────────────────────────────────────────────────────────────────
+PLANNER_MODEL: str = os.getenv("OPENAI_MODEL_PLANNER", "o3-mini")
+EXECUTOR_MODEL: str = os.getenv("OPENAI_MODEL_EXECUTOR", "computer-use-preview")
+API_KEY: str | None = os.getenv("OPENAI_API_KEY")
+
+if not API_KEY:
+    raise RuntimeError("⚠️  OPENAI_API_KEY env var is missing!")
 
 client = OpenAI(api_key=API_KEY)
 
-def handle_action(page, a):
+# ──────────────────────────────────────────────────────────────────────────────
+# Helper functions
+# ──────────────────────────────────────────────────────────────────────────────
+
+def handle_action(page, action):
+    """Maps a `computer_call.action` to a real Playwright command."""
     try:
-        match a.type:
-            case "click":      page.mouse.click(a.x, a.y, button=a.button or "left")
-            case "scroll":     page.mouse.move(a.x, a.y); page.evaluate(f"window.scrollBy({a.scroll_x},{a.scroll_y})")
-            case "type":       page.keyboard.type(a.text)
-            case "keypress":   [page.keyboard.press(k) for k in a.keys]
-            case "wait":       time.sleep(2)
-    except Exception as e:
-        print("Playwright error:", e)
+        match action.type:
+            case "click":
+                page.mouse.click(action.x, action.y, button=action.button or "left")
+            case "scroll":
+                page.mouse.move(action.x, action.y)
+                page.evaluate(f"window.scrollBy({action.scroll_x}, {action.scroll_y})")
+            case "type":
+                page.keyboard.type(action.text)
+            case "keypress":
+                for k in action.keys:
+                    page.keyboard.press("Enter" if k.lower() == "enter" else k)
+            case "wait":
+                time.sleep(2)
+            # The model may request a screenshot explicitly; we always take one later.
+            case "screenshot":
+                pass
+            case _:
+                print(f"[handle_action] Unrecognised action: {action.type}")
+    except Exception as exc:
+        print("Playwright error while executing action:", exc)
 
-def screenshot(page):
-    return base64.b64encode(page.screenshot(timeout=60000)).decode()
 
-def plan_with_o3(user_prompt: str) -> str:
-    """Usa o3-mini para producir un *plan textual* (pasos de alto nivel)."""
+def grab_screenshot(page) -> str:
+    """Returns a base‑64 PNG string of the current viewport (60 s timeout)."""
+    img_bytes = page.screenshot(timeout=60_000)
+    return base64.b64encode(img_bytes).decode()
+
+
+def plan_with_o3(prompt: str) -> str:
+    """Uses the cheap `o3-mini` model to generate a high‑level plan (optional)."""
     chat = client.chat.completions.create(
         model=PLANNER_MODEL,
-        messages=[{"role": "user", "content": user_prompt}],
-        max_tokens=300
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=300,
     )
-    return chat.choices[0].message.content
+    return chat.choices[0].message.content.strip()
 
-def run_cua():
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Core runner (called by FastAPI or __main__)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def run_cua(
+    meeting_url: str,
+    first_name: str = "Camilo",
+    last_name: str = "Caceres",
+    email: str = "camilo@rentmies.com",
+    hour: str = "10",
+):
+    """Main function that drives the browser with the executor model."""
+
+    if "hubspot.com" not in meeting_url:
+        raise ValueError("meeting_url must be a valid HubSpot link")
+
+    # User prompt the executor model will receive
     user_prompt = (
-        "Abre https://meetings.hubspot.com/caceres-d/prueba-rentimies y "
-        "agenda cualquier cita disponible; luego llena: "
-        "Nombre=Camilo, Apellido=Caceres, email=camilo@rentmies.com, "
-        "hora=10 y confirma."
+        f"Abre {meeting_url} y agenda cualquier cita disponible. "
+        f"Luego rellena Nombre='{first_name}', Apellido='{last_name}', "
+        f"Correo='{email}', Hora='{hour}' y confirma."
     )
 
-    print("🧠 Paso 1 — o3-mini (planner)")
-    high_level_plan = plan_with_o3(user_prompt)
-    print(high_level_plan)
+    # Optional high‑level plan (mostly for logs/debugging)
+    print("🧠  Generando plan con", PLANNER_MODEL)
+    try:
+        plan = plan_with_o3(user_prompt)
+        for line in plan.splitlines():
+            print("   ·", line)
+    except Exception as exc:  # plan step is best‑effort
+        print("[plan_with_o3]", exc)
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True, args=["--disable-extensions", "--disable-file-system"])
-        page    = browser.new_page()
+        browser = p.chromium.launch(
+            headless=True,
+            args=["--disable-extensions", "--disable-file-system"],
+        )
+        page = browser.new_page()
         page.set_viewport_size({"width": 1024, "height": 768})
-        page.goto("https://meetings.hubspot.com/caceres-d/prueba-rentimies")
+        page.goto(meeting_url)
 
-        # Primer turno para el modelo de ejecución
+        # First message to executor model
         response = client.responses.create(
             model=EXECUTOR_MODEL,
-            tools=[{"type": "computer_use_preview", "display_width": 1024,
-                    "display_height": 768, "environment": "browser"}],
+            tools=[{
+                "type": "computer_use_preview",
+                "display_width": 1024,
+                "display_height": 768,
+                "environment": "browser",
+            }],
             input=[{"role": "user", "content": user_prompt}],
-            truncation="auto"
+            truncation="auto",
         )
 
+        # Main loop — keep feeding screenshots until no more computer_call
         while True:
-            calls = [i for i in response.output if i.type == "computer_call"]
+            calls = [item for item in response.output if item.type == "computer_call"]
             if not calls:
-                print("✅  Terminado")
+                print("✅  Sin más acciones. Proceso concluido.")
                 break
 
             call = calls[0]
@@ -70,17 +149,34 @@ def run_cua():
             response = client.responses.create(
                 model=EXECUTOR_MODEL,
                 previous_response_id=response.id,
-                tools=[{"type": "computer_use_preview", "display_width": 1024,
-                        "display_height": 768, "environment": "browser"}],
+                tools=[{
+                    "type": "computer_use_preview",
+                    "display_width": 1024,
+                    "display_height": 768,
+                    "environment": "browser",
+                }],
                 input=[{
                     "call_id": call.call_id,
                     "type": "computer_call_output",
                     "output": {
                         "type": "input_image",
-                        "image_url": f"data:image/png;base64,{screenshot(page)}"
-                    }
+                        "image_url": f"data:image/png;base64,{grab_screenshot(page)}",
+                    },
                 }],
-                truncation="auto"
+                truncation="auto",
             )
 
         browser.close()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# CLI helper so you can run:  python cua_runner.py <url> [first last mail hour]
+# ──────────────────────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    args = sys.argv[1:]
+    if not args:
+        # Default quick test
+        run_cua("https://meetings.hubspot.com/caceres-d/prueba-rentmies")
+    else:
+        run_cua(*args)
+```
