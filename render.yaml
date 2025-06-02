@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: cua-agent
+    env: python
+    plan: free
+    region: frankfurt          # puedes dejarlo o cambiarlo
+    buildCommand: |
+      pip install -r app/requirements.txt
+      playwright install --with-deps
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port 8000
+    envVars:
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: OPENAI_MODEL_PLANNER
+        sync: false
+      - key: OPENAI_MODEL_EXECUTOR
+        sync: false
